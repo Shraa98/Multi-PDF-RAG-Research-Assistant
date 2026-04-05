@@ -18,6 +18,7 @@ __pycache__/
 venv/
 env/
 rag_env/
+rag_env_310/
 
 # Local app artifacts
 vector_store/

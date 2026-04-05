@@ -3,6 +3,8 @@ import sys
 
 import groq
 import streamlit as st
+from dotenv import load_dotenv
+from langfuse import Langfuse
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -10,7 +12,9 @@ from src.rag_pipeline import (
     AVAILABLE_PROVIDERS,
     DEFAULT_MODEL_NAME,
     DEFAULT_PROVIDER,
+    _get_prompt_client,
     build_rag_from_scratch,
+    extract_answer_and_usage,
     get_debug_for_question,
     get_models_for_provider,
     get_sources_for_question,
@@ -18,6 +22,18 @@ from src.rag_pipeline import (
     select_unique_sources,
     split_questions,
 )
+
+load_dotenv()
+
+langfuse = None
+if all(
+    os.getenv(key)
+    for key in ("LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_BASE_URL")
+):
+    try:
+        langfuse = Langfuse()
+    except Exception:
+        langfuse = None
 
 
 st.set_page_config(
@@ -43,6 +59,8 @@ if "provider_name" not in st.session_state:
     st.session_state.provider_name = DEFAULT_PROVIDER
 if "model_name" not in st.session_state:
     st.session_state.model_name = DEFAULT_MODEL_NAME
+if "langfuse_prompt_client" not in st.session_state:
+    st.session_state.langfuse_prompt_client = None
 
 with st.sidebar:
     st.header("PDF Management")
@@ -89,6 +107,7 @@ with st.sidebar:
                 )
                 st.session_state.rag_chain = chain
                 st.session_state.vector_store = vs
+                st.session_state.langfuse_prompt_client = _get_prompt_client()
                 st.session_state.chat_history = []
             if chain:
                 st.success("Ready.")
@@ -104,6 +123,7 @@ with st.sidebar:
                 )
                 st.session_state.rag_chain = chain
                 st.session_state.vector_store = vs
+                st.session_state.langfuse_prompt_client = _get_prompt_client()
             st.success("Loaded.")
 
     st.session_state.debug_retrieval = st.checkbox(
@@ -169,11 +189,33 @@ else:
     if question:
         subquestions = split_questions(question)
         responses = []
+        prompt_client = st.session_state.langfuse_prompt_client
 
         try:
             with st.spinner("Searching PDFs..."):
                 for subquestion in subquestions:
-                    answer = st.session_state.rag_chain.invoke(subquestion)
+                    if langfuse is not None:
+                        with langfuse.start_as_current_observation(
+                            name="rag-generation",
+                            as_type="generation",
+                            model=st.session_state.model_name,
+                            input={"question": subquestion},
+                            prompt=prompt_client,
+                            metadata={
+                                "provider": st.session_state.provider_name,
+                                "source_limit": st.session_state.source_limit,
+                            },
+                        ) as generation:
+                            llm_result = st.session_state.rag_chain.invoke(subquestion)
+                            answer, usage_details = extract_answer_and_usage(llm_result)
+                            generation.update(
+                                output=answer,
+                                usage_details=usage_details if usage_details else None,
+                            )
+                    else:
+                        llm_result = st.session_state.rag_chain.invoke(subquestion)
+                        answer, _ = extract_answer_and_usage(llm_result)
+
                     sources = get_sources_for_question(
                         st.session_state.vector_store,
                         subquestion,
@@ -194,6 +236,9 @@ else:
                         "sources": unique_sources,
                         "debug": debug_items,
                     })
+                if langfuse is not None:
+                    langfuse.flush()
+
         except groq.RateLimitError as exc:
             st.error(
                 "Groq rate limit reached. Your token budget is exhausted for now. "

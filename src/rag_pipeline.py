@@ -2,8 +2,8 @@ import os
 import re
 
 from dotenv import load_dotenv
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import PromptTemplate
+from langfuse import Langfuse
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables import RunnablePassthrough
 
@@ -18,6 +18,7 @@ MAX_CHARS_PER_DOC = 1200
 MAX_CONTEXT_CHARS = 5000
 DEFAULT_PROVIDER = "Groq"
 DEFAULT_MODEL_NAME = "llama-3.1-8b-instant"
+LANGFUSE_PROMPT_NAME = "multi-pdf-rag"
 PROVIDER_MODELS = {
     "Groq": [
         "llama-3.1-8b-instant",
@@ -39,7 +40,7 @@ PROVIDER_MODELS = {
 AVAILABLE_PROVIDERS = list(PROVIDER_MODELS.keys())
 AVAILABLE_MODELS = PROVIDER_MODELS[DEFAULT_PROVIDER]
 
-PROMPT_TEMPLATE = """
+PROMPT_SYSTEM_TEMPLATE = """
 You are a helpful research assistant.
 Answer the question using ONLY the context from the PDFs provided.
 If the answer requires combining multiple retrieved passages, synthesize them into one answer and mention all relevant PDFs/sources.
@@ -49,7 +50,9 @@ Prefer the most direct factual answer first, then a short explanation.
 If the answer is not in the context, say:
 "I couldn't find this information in the uploaded PDFs."
 Do NOT make up any information.
+"""
 
+PROMPT_USER_TEMPLATE = """
 Context:
 {context}
 
@@ -57,6 +60,16 @@ Question: {question}
 
 Answer (mention source PDF):
 """
+
+langfuse = None
+if all(
+    os.getenv(key)
+    for key in ("LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_BASE_URL")
+):
+    try:
+        langfuse = Langfuse()
+    except Exception:
+        langfuse = None
 
 
 def format_docs(docs):
@@ -165,11 +178,7 @@ def load_existing_rag(model_name=DEFAULT_MODEL_NAME, provider=DEFAULT_PROVIDER):
 
 def _build_chain(vector_store, model_name=DEFAULT_MODEL_NAME, provider=DEFAULT_PROVIDER):
     llm = _build_llm(provider=provider, model_name=model_name)
-
-    prompt = PromptTemplate(
-        template=PROMPT_TEMPLATE,
-        input_variables=["context", "question"],
-    )
+    prompt_client = _get_prompt_client()
 
     retriever = get_retriever(vector_store, k=6)
 
@@ -178,13 +187,109 @@ def _build_chain(vector_store, model_name=DEFAULT_MODEL_NAME, provider=DEFAULT_P
             "context": RunnableLambda(lambda question: format_docs(retrieve_chunks(retriever, question))),
             "question": RunnablePassthrough(),
         }
-        | prompt
+        | RunnableLambda(
+            lambda payload: _build_prompt_messages(
+                prompt_client=prompt_client,
+                context=payload["context"],
+                question=payload["question"],
+            )
+        )
         | llm
-        | StrOutputParser()
     )
 
     print(f"RAG chain ready with provider={provider}, model={model_name}")
     return rag_chain
+
+def _get_prompt_client():
+    if langfuse is None:
+        return None
+
+    fallback = [
+        {"role": "system", "content": PROMPT_SYSTEM_TEMPLATE.strip()},
+        {"role": "user", "content": PROMPT_USER_TEMPLATE.strip().replace("{", "{{").replace("}", "}}")},
+    ]
+
+    try:
+        return langfuse.get_prompt(
+            LANGFUSE_PROMPT_NAME,
+            type="chat",
+            label="production",
+            fallback=fallback,
+        )
+    except Exception:
+        return None
+
+
+def _build_prompt_messages(prompt_client, context, question):
+    if prompt_client is None:
+        return _build_fallback_messages(context=context, question=question)
+
+    try:
+        compiled_messages = prompt_client.compile(context=context, question=question)
+        return [_to_langchain_message(message) for message in compiled_messages]
+    except Exception:
+        return _build_fallback_messages(context=context, question=question)
+
+
+def _build_fallback_messages(context, question):
+    return [
+        SystemMessage(content=PROMPT_SYSTEM_TEMPLATE.strip()),
+        HumanMessage(
+            content=PROMPT_USER_TEMPLATE.format(
+                context=context,
+                question=question,
+            ).strip()
+        ),
+    ]
+
+
+def _to_langchain_message(message):
+    role = message["role"]
+    content = message["content"]
+
+    if role == "system":
+        return SystemMessage(content=content)
+    if role == "assistant":
+        return AIMessage(content=content)
+
+    return HumanMessage(content=content)
+
+
+def extract_answer_and_usage(result):
+    if isinstance(result, str):
+        return result, {}
+
+    answer = getattr(result, "content", "")
+    usage_details = {}
+
+    usage_metadata = getattr(result, "usage_metadata", None) or {}
+    if usage_metadata:
+        prompt_tokens = usage_metadata.get("input_tokens")
+        completion_tokens = usage_metadata.get("output_tokens")
+        total_tokens = usage_metadata.get("total_tokens")
+
+        if prompt_tokens is not None:
+            usage_details["prompt_tokens"] = int(prompt_tokens)
+        if completion_tokens is not None:
+            usage_details["completion_tokens"] = int(completion_tokens)
+        if total_tokens is not None:
+            usage_details["total_tokens"] = int(total_tokens)
+
+    if not usage_details:
+        response_metadata = getattr(result, "response_metadata", None) or {}
+        token_usage = response_metadata.get("token_usage", {}) if isinstance(response_metadata, dict) else {}
+        prompt_tokens = token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+        completion_tokens = token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+        total_tokens = token_usage.get("total_tokens")
+
+        if prompt_tokens is not None:
+            usage_details["prompt_tokens"] = int(prompt_tokens)
+        if completion_tokens is not None:
+            usage_details["completion_tokens"] = int(completion_tokens)
+        if total_tokens is not None:
+            usage_details["total_tokens"] = int(total_tokens)
+
+    return answer, usage_details
 
 
 def get_models_for_provider(provider):
