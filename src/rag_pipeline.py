@@ -19,6 +19,39 @@ MAX_CONTEXT_CHARS = 5000
 DEFAULT_PROVIDER = "Groq"
 DEFAULT_MODEL_NAME = "llama-3.1-8b-instant"
 LANGFUSE_PROMPT_NAME = "multi-pdf-rag"
+MIN_ROUTING_LEXICAL_SCORE = 8
+MIN_ROUTING_SEMANTIC_MATCHES = 1
+ROUTING_DOC_KEYWORDS = {
+    "pdf",
+    "pdfs",
+    "document",
+    "documents",
+    "paper",
+    "papers",
+    "uploaded",
+    "source",
+    "sources",
+    "chunk",
+    "page",
+    "according",
+    "from the pdf",
+    "from pdf",
+    "in the pdf",
+}
+ROUTING_CHAT_KEYWORDS = {
+    "hi",
+    "hello",
+    "hey",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "how are you",
+    "thanks",
+    "thank you",
+    "who are you",
+    "what can you do",
+    "joke",
+}
 PROVIDER_MODELS = {
     "Groq": [
         "llama-3.1-8b-instant",
@@ -31,6 +64,11 @@ PROVIDER_MODELS = {
         "gemini-2.5-flash",
         "gemini-2.0-flash",
     ],
+    "OpenRouter": [
+        "openai/gpt-4o-mini",
+        "anthropic/claude-3.5-sonnet",
+        "google/gemini-2.5-flash",
+    ],
     "Ollama": [
         "llama3.1:8b",
         "mistral:7b",
@@ -41,25 +79,56 @@ AVAILABLE_PROVIDERS = list(PROVIDER_MODELS.keys())
 AVAILABLE_MODELS = PROVIDER_MODELS[DEFAULT_PROVIDER]
 
 PROMPT_SYSTEM_TEMPLATE = """
-You are a helpful research assistant.
+You are a helpful, expert research assistant.
 Answer the question using ONLY the context from the PDFs provided.
-If the answer requires combining multiple retrieved passages, synthesize them into one answer and mention all relevant PDFs/sources.
-For comparison questions, compare only what is explicitly supported by the retrieved context.
-If the question is awkwardly phrased but the context contains the closest equivalent fact, answer using the paper's exact terminology instead of refusing.
-Prefer the most direct factual answer first, then a short explanation.
-If the answer is not in the context, say:
+Use a warm, clear, teaching-oriented tone.
+When possible, start with a direct answer in one sentence, then add concise explanation.
+For how-to or workflow questions, use a structured format:
+- Why this matters (1 short line)
+- Step-by-step (numbered)
+- Practical tip (optional, 1 line)
+For definition/fact questions, use:
+- Direct answer
+- Short explanation
+If the answer requires combining multiple retrieved passages, synthesize them and mention all relevant sources.
+For comparison questions, compare only what is explicitly supported by retrieved context.
+If the question is awkwardly phrased but context contains the closest equivalent fact, answer using the paper's exact terminology.
+If multiple questions are asked, answer each sub-question clearly in order.
+If the answer is not in the context, say exactly:
 "I couldn't find this information in the uploaded PDFs."
 Do NOT make up any information.
+MUST : After each ask like Do you have any questions? or Do you want me to explain more? or Would you like an example? or Do you want me to walk you through it step by step? or similar, wait for user response and do NOT continue until user asks to continue.
 """
 
 PROMPT_USER_TEMPLATE = """
+Use the following context to answer the question.
+
 Context:
 {context}
 
-Question: {question}
+Question:
+{question}
 
-Answer (mention source PDF):
+Answer:
+- Start with a direct answer
+- Then explain briefly in simple language
+- Mention source PDF(s) when available
 """
+
+GENERAL_CHAT_SYSTEM_TEMPLATE = """
+You are a helpful AI assistant.
+Respond naturally, clearly, and confidently.
+Keep the tone supportive and practical, similar to a strong technical mentor.
+When the user asks a general question or greets you, answer directly without referencing uploaded PDFs.
+For request-style questions, prefer this structure:
+1) Quick acknowledgement of intent (1 line)
+2) Clear answer
+3) Actionable steps (if relevant)
+If the user asks for guidance, provide concrete examples and next steps.
+Avoid robotic or overly brief replies.
+"""
+
+NOT_FOUND_MESSAGE = "I couldn't find this information in the uploaded PDFs."
 
 langfuse = None
 if all(
@@ -292,6 +361,117 @@ def extract_answer_and_usage(result):
     return answer, usage_details
 
 
+def extract_model_name(result, fallback_model=None):
+    model_name = fallback_model
+    if isinstance(result, str):
+        return model_name
+
+    response_metadata = getattr(result, "response_metadata", None) or {}
+    if isinstance(response_metadata, dict):
+        model_name = (
+            response_metadata.get("model_name")
+            or response_metadata.get("model")
+            or response_metadata.get("model_id")
+            or model_name
+        )
+
+    model_name = getattr(result, "model_name", model_name)
+    model_name = getattr(result, "model", model_name)
+    return model_name
+
+
+def format_assistant_answer(question, answer, mode="rag"):
+    text = (answer or "").strip()
+    if not text:
+        return text
+
+    if mode == "rag" and NOT_FOUND_MESSAGE.lower() in text.lower():
+        return text
+
+    lowered = text.lower()
+    intro_prefixes = (
+        "great question",
+        "good question",
+        "let me explain",
+        "sure",
+        "absolutely",
+        "here's",
+        "hello",
+    )
+    if any(lowered.startswith(prefix) for prefix in intro_prefixes):
+        return _improve_readability(text)
+
+    question_l = question.lower()
+    intro = ""
+    if "how" in question_l:
+        intro = "Let me walk you through it step by step."
+    elif "why" in question_l:
+        intro = "That is an important question."
+    elif "what" in question_l:
+        intro = "Great question."
+    elif mode == "general":
+        intro = "Good question."
+
+    if intro:
+        text = f"{intro}\n\n{text}"
+    return _improve_readability(text)
+
+
+def _improve_readability(text):
+    compact = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return compact
+
+
+def build_chat_llm(provider, model_name):
+    return _build_llm(provider=provider, model_name=model_name)
+
+
+def build_general_chat_messages(question, recent_turns=None):
+    messages = [SystemMessage(content=GENERAL_CHAT_SYSTEM_TEMPLATE.strip())]
+
+    for turn in (recent_turns or []):
+        user_text = turn.get("user", "").strip()
+        assistant_text = turn.get("assistant", "").strip()
+        if user_text:
+            messages.append(HumanMessage(content=user_text))
+        if assistant_text:
+            messages.append(AIMessage(content=assistant_text))
+
+    messages.append(HumanMessage(content=question.strip()))
+    return messages
+
+
+def should_route_to_rag(question, debug_items):
+    normalized_question = _normalize_for_routing(question)
+    if not normalized_question:
+        return False, "empty question -> general chat"
+
+    if any(keyword in normalized_question for keyword in ROUTING_DOC_KEYWORDS):
+        return True, "document-specific wording detected"
+
+    is_chat_like = any(keyword in normalized_question for keyword in ROUTING_CHAT_KEYWORDS)
+    if is_chat_like and len(normalized_question.split()) <= 8:
+        return False, "chat-like greeting/small-talk detected"
+
+    semantic_matches = sum(1 for item in debug_items if item.get("semantic_match"))
+    best_lexical_score = max((item.get("lexical_score", 0) for item in debug_items), default=0)
+
+    if semantic_matches >= MIN_ROUTING_SEMANTIC_MATCHES and best_lexical_score >= MIN_ROUTING_LEXICAL_SCORE:
+        return True, "retrieval confidence is strong"
+
+    if semantic_matches == 0 and best_lexical_score < MIN_ROUTING_LEXICAL_SCORE:
+        return False, "retrieval confidence is weak"
+
+    if len(normalized_question.split()) <= 5 and is_chat_like:
+        return False, "short conversational query"
+
+    return True, "defaulting to RAG for factual/unknown queries"
+
+
+def _normalize_for_routing(text):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", text.lower())).strip()
+
+
 def get_models_for_provider(provider):
     return PROVIDER_MODELS.get(provider, [])
 
@@ -326,6 +506,37 @@ def _build_llm(provider, model_name):
         if not api_key:
             raise ValueError("Missing GOOGLE_API_KEY in environment.")
         return ChatGoogleGenerativeAI(model=model_name, google_api_key=api_key, temperature=0)
+
+    if provider == "OpenRouter":
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:
+            raise ImportError("OpenRouter support requires installing langchain-openai.") from exc
+
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("Missing OPENROUTER_API_KEY in environment.")
+
+        base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        default_headers = {}
+        site_url = os.getenv("OPENROUTER_SITE_URL")
+        app_name = os.getenv("OPENROUTER_APP_NAME")
+
+        if site_url:
+            default_headers["HTTP-Referer"] = site_url
+        if app_name:
+            default_headers["X-Title"] = app_name
+
+        kwargs = {
+            "api_key": api_key,
+            "model": model_name,
+            "base_url": base_url,
+            "temperature": 0,
+        }
+        if default_headers:
+            kwargs["default_headers"] = default_headers
+
+        return ChatOpenAI(**kwargs)
 
     if provider == "Anthropic":
         try:

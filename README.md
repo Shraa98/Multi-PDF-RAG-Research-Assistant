@@ -12,6 +12,7 @@ A Streamlit-based Retrieval-Augmented Generation (RAG) app that lets you upload 
 - Multiple LLM providers in UI:
   - Groq
   - Google Gemini
+  - OpenRouter
   - Ollama (local)
 
 ## Tech Stack
@@ -78,6 +79,9 @@ GROQ_API_KEY=your_groq_api_key
 
 # Required if using Google provider
 GOOGLE_API_KEY=your_google_api_key
+
+# Required if using OpenRouter provider
+OPENROUTER_API_KEY=your_openrouter_api_key
 
 # Optional (for Ollama; default shown)
 OLLAMA_BASE_URL=http://localhost:11434
