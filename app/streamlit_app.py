@@ -5,23 +5,78 @@ import groq
 import streamlit as st
 from dotenv import load_dotenv
 from langfuse import Langfuse
+from langchain_core.messages import HumanMessage, SystemMessage
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.rag_pipeline import (
-    AVAILABLE_PROVIDERS,
-    DEFAULT_MODEL_NAME,
-    DEFAULT_PROVIDER,
-    _get_prompt_client,
-    build_rag_from_scratch,
-    extract_answer_and_usage,
-    get_debug_for_question,
-    get_models_for_provider,
-    get_sources_for_question,
-    load_existing_rag,
-    select_unique_sources,
-    split_questions,
-)
+from src import rag_pipeline as rag
+
+AVAILABLE_PROVIDERS = rag.AVAILABLE_PROVIDERS
+DEFAULT_MODEL_NAME = rag.DEFAULT_MODEL_NAME
+DEFAULT_PROVIDER = rag.DEFAULT_PROVIDER
+_get_prompt_client = rag._get_prompt_client
+build_rag_from_scratch = rag.build_rag_from_scratch
+extract_answer_and_usage = rag.extract_answer_and_usage
+get_debug_for_question = rag.get_debug_for_question
+get_models_for_provider = rag.get_models_for_provider
+get_sources_for_question = rag.get_sources_for_question
+load_existing_rag = rag.load_existing_rag
+select_unique_sources = rag.select_unique_sources
+split_questions = rag.split_questions
+format_assistant_answer = getattr(rag, "format_assistant_answer", None)
+
+
+def extract_model_name(result, fallback_model=None):
+    extractor = getattr(rag, "extract_model_name", None)
+    if extractor is None:
+        return fallback_model
+    return extractor(result, fallback_model=fallback_model)
+
+
+def build_chat_llm(provider, model_name):
+    if hasattr(rag, "build_chat_llm"):
+        return rag.build_chat_llm(provider=provider, model_name=model_name)
+    return rag._build_llm(provider=provider, model_name=model_name)
+
+
+def build_general_chat_messages(question, recent_turns=None):
+    if hasattr(rag, "build_general_chat_messages"):
+        return rag.build_general_chat_messages(question, recent_turns=recent_turns)
+    return [
+        SystemMessage(content="You are a helpful AI assistant."),
+        HumanMessage(content=question.strip()),
+    ]
+
+
+def should_route_to_rag(question, debug_items):
+    if hasattr(rag, "should_route_to_rag"):
+        return rag.should_route_to_rag(question, debug_items)
+    return True, "routing helper unavailable; defaulting to RAG"
+
+
+def get_recent_general_turns(max_turns=4):
+    turns = []
+    history = st.session_state.get("chat_history", [])
+
+    for chat in reversed(history):
+        responses = chat.get("responses") or []
+        if not responses:
+            continue
+
+        for response in reversed(responses):
+            if response.get("mode") != "general":
+                continue
+            user_q = (response.get("question") or chat.get("question") or "").strip()
+            assistant_a = (response.get("answer") or "").strip()
+            if user_q and assistant_a:
+                turns.append({"user": user_q, "assistant": assistant_a})
+                if len(turns) >= max_turns:
+                    break
+        if len(turns) >= max_turns:
+            break
+
+    turns.reverse()
+    return turns
 
 load_dotenv()
 
@@ -61,6 +116,12 @@ if "model_name" not in st.session_state:
     st.session_state.model_name = DEFAULT_MODEL_NAME
 if "langfuse_prompt_client" not in st.session_state:
     st.session_state.langfuse_prompt_client = None
+if "general_llm" not in st.session_state:
+    st.session_state.general_llm = None
+if "general_llm_provider" not in st.session_state:
+    st.session_state.general_llm_provider = None
+if "general_llm_model" not in st.session_state:
+    st.session_state.general_llm_model = None
 
 with st.sidebar:
     st.header("PDF Management")
@@ -84,7 +145,7 @@ with st.sidebar:
         "LLM provider",
         options=AVAILABLE_PROVIDERS,
         index=AVAILABLE_PROVIDERS.index(st.session_state.provider_name),
-        help="Free-friendly options only: Groq free tier, Google Gemini free tier, or local Ollama.",
+        help="Choose your provider backend (Groq, Google, OpenRouter, or local Ollama).",
     )
 
     provider_models = get_models_for_provider(st.session_state.provider_name)
@@ -95,7 +156,7 @@ with st.sidebar:
         "Model",
         options=provider_models,
         index=provider_models.index(st.session_state.model_name),
-        help="Choose a lower-cost free-tier model first; local Ollama avoids API costs entirely.",
+        help="Choose the model for the selected provider.",
     )
 
     with col1:
@@ -163,12 +224,22 @@ else:
                 if len(responses) > 1:
                     st.markdown(f"**{response['question']}**")
                 st.write(response["answer"])
-                with st.expander(f"Sources used: {response['question']}"):
-                    for i, src in enumerate(response["sources"], 1):
-                        page = src.metadata.get("page")
-                        page_label = f" (Page {page})" if page else ""
-                        st.markdown(f"**Source {i}:** `{src.metadata.get('source', 'Unknown')}`{page_label}")
-                        st.caption(src.page_content[:300] + "...")
+                mode = response.get("mode", "rag")
+                routing_reason = response.get("routing_reason")
+                if mode == "general":
+                    st.caption("Routed to: General Chat")
+                    if routing_reason:
+                        st.caption(f"Reason: {routing_reason}")
+                else:
+                    st.caption("Routed to: RAG")
+                    if routing_reason:
+                        st.caption(f"Reason: {routing_reason}")
+                    with st.expander(f"Sources used: {response['question']}"):
+                        for i, src in enumerate(response["sources"], 1):
+                            page = src.metadata.get("page")
+                            page_label = f" (Page {page})" if page else ""
+                            st.markdown(f"**Source {i}:** `{src.metadata.get('source', 'Unknown')}`{page_label}")
+                            st.caption(src.page_content[:300] + "...")
 
                 if st.session_state.debug_retrieval and response.get("debug"):
                     with st.expander(f"Debug retrieval: {response['question']}"):
@@ -193,7 +264,26 @@ else:
 
         try:
             with st.spinner("Searching PDFs..."):
+                if (
+                    st.session_state.general_llm is None
+                    or st.session_state.general_llm_provider != st.session_state.provider_name
+                    or st.session_state.general_llm_model != st.session_state.model_name
+                ):
+                    st.session_state.general_llm = build_chat_llm(
+                        provider=st.session_state.provider_name,
+                        model_name=st.session_state.model_name,
+                    )
+                    st.session_state.general_llm_provider = st.session_state.provider_name
+                    st.session_state.general_llm_model = st.session_state.model_name
+
                 for subquestion in subquestions:
+                    debug_items = get_debug_for_question(
+                        st.session_state.vector_store,
+                        subquestion,
+                        k=max(st.session_state.source_limit * 3, 6),
+                    )
+                    use_rag, routing_reason = should_route_to_rag(subquestion, debug_items)
+
                     if langfuse is not None:
                         with langfuse.start_as_current_observation(
                             name="rag-generation",
@@ -203,36 +293,77 @@ else:
                             prompt=prompt_client,
                             metadata={
                                 "provider": st.session_state.provider_name,
+                                "model_name": st.session_state.model_name,
                                 "source_limit": st.session_state.source_limit,
+                                "route": "rag" if use_rag else "general",
+                                "routing_reason": routing_reason,
                             },
                         ) as generation:
-                            llm_result = st.session_state.rag_chain.invoke(subquestion)
+                            if use_rag:
+                                llm_result = st.session_state.rag_chain.invoke(subquestion)
+                            else:
+                                recent_turns = get_recent_general_turns(max_turns=4)
+                                llm_result = st.session_state.general_llm.invoke(
+                                    build_general_chat_messages(subquestion, recent_turns=recent_turns)
+                                )
                             answer, usage_details = extract_answer_and_usage(llm_result)
+                            if format_assistant_answer is not None:
+                                answer = format_assistant_answer(
+                                    question=subquestion,
+                                    answer=answer,
+                                    mode="rag" if use_rag else "general",
+                                )
+                            resolved_model = extract_model_name(
+                                llm_result,
+                                fallback_model=st.session_state.model_name,
+                            )
                             generation.update(
                                 output=answer,
                                 usage_details=usage_details if usage_details else None,
+                                model=resolved_model,
+                                metadata={
+                                    "provider": st.session_state.provider_name,
+                                    "model_name": st.session_state.model_name,
+                                    "resolved_model": resolved_model,
+                                    "source_limit": st.session_state.source_limit,
+                                    "route": "rag" if use_rag else "general",
+                                    "routing_reason": routing_reason,
+                                },
                             )
                     else:
-                        llm_result = st.session_state.rag_chain.invoke(subquestion)
+                        if use_rag:
+                            llm_result = st.session_state.rag_chain.invoke(subquestion)
+                        else:
+                            recent_turns = get_recent_general_turns(max_turns=4)
+                            llm_result = st.session_state.general_llm.invoke(
+                                build_general_chat_messages(subquestion, recent_turns=recent_turns)
+                            )
                         answer, _ = extract_answer_and_usage(llm_result)
+                        if format_assistant_answer is not None:
+                            answer = format_assistant_answer(
+                                question=subquestion,
+                                answer=answer,
+                                mode="rag" if use_rag else "general",
+                            )
 
-                    sources = get_sources_for_question(
-                        st.session_state.vector_store,
-                        subquestion,
-                        k=max(st.session_state.source_limit * 3, 6),
-                    )
-                    unique_sources = select_unique_sources(
-                        sources,
-                        limit=st.session_state.source_limit,
-                    )
-                    debug_items = get_debug_for_question(
-                        st.session_state.vector_store,
-                        subquestion,
-                        k=max(st.session_state.source_limit * 3, 6),
-                    )
+                    if use_rag:
+                        sources = get_sources_for_question(
+                            st.session_state.vector_store,
+                            subquestion,
+                            k=max(st.session_state.source_limit * 3, 6),
+                        )
+                        unique_sources = select_unique_sources(
+                            sources,
+                            limit=st.session_state.source_limit,
+                        )
+                    else:
+                        unique_sources = []
+
                     responses.append({
                         "question": subquestion,
                         "answer": answer,
+                        "mode": "rag" if use_rag else "general",
+                        "routing_reason": routing_reason,
                         "sources": unique_sources,
                         "debug": debug_items,
                     })
